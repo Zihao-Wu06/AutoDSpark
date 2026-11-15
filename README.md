@@ -2,7 +2,7 @@
 
 # AutoDSpark
 
-### Make your own LLM answer up to 2.8x faster.
+### Make your own LLM generate up to 2.8x faster.
 
 **One command trains a small helper model that speeds up your LLM.<br>Faster inference, same performance.**
 
