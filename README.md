@@ -4,12 +4,12 @@
 
 ### Make your own LLM answer up to 2.8x faster.
 
-**One command trains a small helper model that speeds up your LLM.<br>Same answers, much less waiting.**
+**One command trains a small helper model that speeds up your LLM.<br>Faster inference, same performance.**
 
 [![Speedup](https://img.shields.io/badge/Qwen3--4B-1.83x_faster-brightgreen.svg)](#-results)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![vLLM](https://img.shields.io/badge/serves_with-vLLM-green.svg)](https://github.com/vllm-project/vllm)
-[![Status](https://img.shields.io/badge/Status-alpha-yellow.svg)](docs/guide.md#roadmap)
+[![Status](https://img.shields.io/badge/Status-alpha-yellow.svg)](docs/guide.md#limitations)
 
 [Results](#-results) | [How it works](#-how-it-works) | [Get started](#-get-started) | [Full guide](docs/guide.md)
 
@@ -25,7 +25,7 @@
 
 - **Faster answers.** In our Qwen3-4B test, replies came 1.5x to 2.8x faster, depending on the
   task.
-- **Exactly the same answers.** Nothing about your model changes: same weights, same quality.
+- **Same performance.** Nothing about your model changes: same weights, same answers, same quality.
 - **Made for *your* model.** Works for fine-tuned and less common models that have no ready-made
   speed-up available.
 - **One command, a few hours, your own GPUs.** No cluster, no machine-learning expertise needed.
@@ -127,7 +127,7 @@ requests at once the GPU is already busy and the gain is smaller.
 
 ## 📚 Learn more
 
-- [Full guide](docs/guide.md): installation, options, how it works, limitations and roadmap
+- [Full guide](docs/guide.md): installation, options, how it works and limitations
 - [DSpark paper](https://arxiv.org/abs/2607.05147)
 - Issues and pull requests are welcome, especially results from models and GPUs we haven't tested.
 

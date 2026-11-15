@@ -13,7 +13,6 @@ pipeline works, and how to reproduce the published results.
 - [AutoDSpark and Speculators](#autodspark-and-speculators)
 - [FAQ](#faq)
 - [Limitations](#limitations)
-- [Roadmap](#roadmap)
 - [Development](#development)
 
 ## Installation
@@ -283,19 +282,6 @@ concurrency; as the batch grows, the GPU is busier and the gain shrinks.
 - Single machine only (one or more GPUs).
 - vLLM serving only. SGLang users can train with SpecForge instead.
 - Memory and time estimates are rough; they have been checked on Qwen3 runs only.
-
-## Roadmap
-
-- [x] Single GPU shared by vLLM and training
-- [x] Data-parallel response regeneration and multi-GPU training
-- [x] Built-in baseline vs DSpark benchmark and report
-- [x] Claude Code skill
-- [ ] Planner picks the shared multi-GPU layout automatically
-- [ ] Published results for larger Qwen3 models, Llama 3.x and Gemma, `standard` preset
-- [ ] Calibrated memory and time estimates
-- [ ] Install the Claude Code skill as a plugin
-- [ ] Optional SpecForge backend for SGLang
-- [ ] Multi-node training
 
 ## Development
 
