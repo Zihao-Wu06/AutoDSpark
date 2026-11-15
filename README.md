@@ -10,7 +10,7 @@
 [![Speculators](https://img.shields.io/badge/Speculators-0.9.0-green.svg)](https://github.com/vllm-project/speculators)
 [![Status](https://img.shields.io/badge/Status-alpha-yellow.svg)](#-roadmap)
 
-[Quick start](#-quick-start) | [Results](#-results) | [How it works](#-how-it-works) | [Claude Code skill](#-use-it-with-claude-code) | [中文说明](README.zh-CN.md)
+[Quick start](#-quick-start) | [Results](#-results) | [How it works](#-how-it-works) | [Claude Code skill](#-use-it-with-claude-code)
 
 </div>
 
