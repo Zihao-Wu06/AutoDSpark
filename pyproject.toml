@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "autodspark"
 version = "0.1.0"
-description = "One command to train a DSpark speculative-decoding drafter for your own model, built on vLLM Speculators."
+description = "Make your own LLM generate faster: one command to train a DSpark speculative-decoding drafter for it, built on vLLM Speculators."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

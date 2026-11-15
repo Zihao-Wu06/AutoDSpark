@@ -2,8 +2,11 @@
 
 # AutoDSpark
 
-**One command to train a [DSpark](https://arxiv.org/abs/2607.05147) speculative-decoding drafter for your own model, then serve it faster with vLLM.**
+### Make your own LLM generate up to 2.8x faster, with one command.
 
+**AutoDSpark trains a [DSpark](https://arxiv.org/abs/2607.05147) speculative-decoding drafter for any local model and serves it with vLLM.<br>Same answers, much less waiting.**
+
+[![Speedup](https://img.shields.io/badge/Qwen3--4B-1.83x_faster-brightgreen.svg)](#-results)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-orange.svg)](pyproject.toml)
 [![vLLM](https://img.shields.io/badge/vLLM-0.33.0-green.svg)](https://github.com/vllm-project/vllm)
@@ -15,13 +18,13 @@
 </div>
 
 <p align="center">
-  <img src="docs/assets/qwen3-4b-speedup.svg" alt="Qwen3-4B with a DSpark drafter trained by AutoDSpark: 1.83x overall, up to 2.83x on math" width="720">
+  <img src="docs/assets/qwen3-4b-speedup.svg" alt="Qwen3-4B generates 1.83x faster overall and 2.83x faster on math with a drafter trained by AutoDSpark" width="720">
 </p>
 
-<p align="center"><sub>Qwen3-4B, <code>--preset medium</code>, trained end to end in under 3 hours on 2× RTX 5090.</sub></p>
+<p align="center"><sub>Qwen3-4B on 2× RTX 5090: <b>165 → 303 tokens/s</b> overall, <b>165 → 467 tokens/s</b> on math.<br>The drafter was trained by AutoDSpark end to end in under 3 hours.</sub></p>
 
 ```bash
-autodspark run --model /models/my-finetuned-qwen3-8b
+autodspark run --model /models/my-finetuned-qwen3-8b   # trains, benchmarks, prints the serve command
 ```
 
 ## 🎉 News
@@ -32,15 +35,23 @@ autodspark run --model /models/my-finetuned-qwen3-8b
 - **[2026/11]** Pipeline check: Qwen3-0.6B with `--preset quick` runs end to end on one
   RTX 5090 in about 15 minutes.
 
-## 📍 Overview
+## ⚡ Faster inference, same answers
 
-Speculative decoding makes an LLM generate faster without changing its output: a small drafter
-proposes several tokens, and the target model checks them all in one forward pass. DSpark is a
-block-parallel drafter that proposes a whole block of tokens at once.
+Every token an LLM writes costs one full forward pass of the model, so long answers are slow no
+matter how big your GPU is. Speculative decoding fixes that: a small drafter guesses the next
+several tokens, and your model checks all of them in a single pass. When the guesses are right,
+you get several tokens for the price of one.
 
-Official DSpark drafters exist for a handful of popular models. If you fine-tuned a model, or use
-one nobody has trained a drafter for, an off-the-shelf drafter matches it poorly and acceptance
-drops. You have to train your own.
+- **No quality loss.** Your model verifies every drafted token, so the output is what it would
+  have written on its own.
+- **No changes to your model.** Same weights, same precision, no quantization or distillation.
+- **Lower latency.** Users wait less for every answer; the biggest wins are on structured
+  output like math, code and extraction.
+
+The catch is that the drafter has to match your model. Official DSpark drafters exist for a
+handful of popular models; if you fine-tuned a model, or use one nobody has trained a drafter
+for, an off-the-shelf drafter matches it poorly and the speedup disappears. **AutoDSpark trains
+the matching drafter for you.**
 
 The training code already exists: [vLLM Speculators](https://github.com/vllm-project/speculators),
 [DeepSpec](https://github.com/deepseek-ai/DeepSpec), [SpecForge](https://github.com/sgl-project/SpecForge)
@@ -61,14 +72,15 @@ drives Speculators, so improvements upstream reach you directly.
 
 ## ✨ Highlights
 
+- **Faster, and you can see it.** Every run ends with a baseline vs DSpark benchmark on your own
+  hardware, so you know the speedup before you deploy.
 - **One command, whole pipeline.** Plan, regenerate data, prepare, train, benchmark and report.
 - **Your model, your data.** Mix your own prompts with public datasets. Your model rewrites every
-  answer, so the drafter learns what *your* model actually says.
+  answer, so the drafter learns what *your* model actually says, which is what makes it fast.
 - **Fits the GPUs you have.** One GPU shared by vLLM and training, or several GPUs with
   data-parallel generation and multi-GPU training. Offline mode when memory is tight.
 - **Hard to break.** Every stage resumes; editing the plan reruns only what changed; out-of-memory
   errors retry with smaller settings.
-- **Measured, not assumed.** Every run ends with a baseline vs DSpark benchmark on your hardware.
 - **Agent-ready.** A Claude Code skill runs the workflow for you and fixes common failures.
 
 ## 📊 Results
