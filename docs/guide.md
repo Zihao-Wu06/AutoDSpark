@@ -22,19 +22,31 @@ pipeline works, and how to reproduce the published results.
 - Linux with NVIDIA GPU(s). One GPU works for small and mid-size models.
 - The target model in **Hugging Face format** (safetensors). GGUF files from Ollama or llama.cpp
   can't be used, because training reads the model's hidden states.
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/) (`pip install uv`), used by `autodspark setup`.
+- Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/)
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`), used to install AutoDSpark and by
+  `autodspark setup`.
 - Disk: a few GB for online mode; much more for offline mode (the plan tells you).
 
 **Install**
 
 ```bash
 git clone https://github.com/Zihao-Wu06/AutoDSpark.git && cd AutoDSpark
-pip install -e .                # not on PyPI yet
+uv venv && . .venv/bin/activate # or: python3 -m venv .venv && . .venv/bin/activate
+uv pip install -e .             # or: pip install -e .   (not on PyPI yet)
 autodspark setup                # builds the Speculators and vLLM environments
 ```
 
+Install AutoDSpark into a virtualenv: Ubuntu 24.04 and other recent distributions refuse
+`pip install` into the system Python (PEP 668, "externally-managed-environment"). On Ubuntu,
+`python3 -m venv` also needs `sudo apt install python3-venv`; `uv venv` does not.
+
 `setup` creates two virtualenvs under `~/.cache/autodspark` (one for Speculators, one for vLLM, so
-their torch versions never clash) and fetches the pinned Speculators scripts.
+their torch versions never clash), installs exactly the tested versions (vLLM 0.33.0, Speculators
+0.9.0 and hs-connectors 0.9.0) and fetches the pinned Speculators scripts. It is safe to re-run,
+for example after a network failure: existing environments are reused, not recreated.
+`autodspark setup --vllm 'vllm==<version>'` installs a different vLLM instead; `doctor` then
+warns that the version is untested. `doctor` also checks that the vLLM environment's torch can
+see your GPUs, which fails when the NVIDIA driver is too old for that torch build.
 
 <details>
 <summary>Slow or blocked access to PyPI, GitHub or Hugging Face</summary>
@@ -43,9 +55,14 @@ Everything AutoDSpark starts inherits your environment, so mirrors and proxies j
 
 ```bash
 export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/   # PyPI mirror for setup
+export UV_PYTHON_INSTALL_MIRROR=https://your-mirror/python-build-standalone/releases/download
 export HF_ENDPOINT=https://hf-mirror.com                         # Hugging Face mirror
 export HTTPS_PROXY=http://your-proxy:port                        # for the GitHub download in setup
 ```
+
+`setup` builds both environments on Python 3.12. If that Python is not installed, uv downloads it
+from GitHub (python-build-standalone); `UV_PYTHON_INSTALL_MIRROR` points uv at a mirror of those
+releases instead, or install Python 3.12 yourself (or pass `--python` with one you have).
 
 Downloading the model ahead of time and passing the local folder to `--model` avoids slow
 first starts: `HF_HUB_ENABLE_HF_TRANSFER=1 hf download Qwen/Qwen3-8B --local-dir ./Qwen3-8B`
@@ -286,7 +303,8 @@ concurrency; as the batch grows, the GPU is busier and the gain shrinks.
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+uv venv && . .venv/bin/activate
+uv pip install -e ".[dev]"
 pytest
 ruff check src tests && ruff format --check src tests
 ```

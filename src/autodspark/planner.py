@@ -8,6 +8,7 @@ settings if training still runs out of memory.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Literal
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from . import SPECULATORS_VERSION, __version__
 from .compat import known_issues
-from .hardware import Hardware
+from .hardware import GPU, Hardware
 from .model_info import GiB, ModelInfo
 
 DEFAULT_PUBLIC_DATASET = "open-perfectblend"
@@ -36,6 +37,9 @@ PRESETS: dict[str, dict[str, int]] = {
 }
 
 GPU_HEADROOM = 0.92  # never plan to fill more than this share of a GPU
+SMALL_GPU_RATIO = 0.5  # GPUs with less usable memory than this share of the biggest are left out
+REGEN_MEM_UTIL = 0.9  # vLLM --gpu-memory-utilization when it has the GPUs to itself
+EVAL_MEM_UTIL = 0.85
 MIN_ANCHORS = 512
 MIN_SEQ_LEN = 2048
 MIN_DRAFT_LAYERS = 3
@@ -98,6 +102,9 @@ class Layout(BaseModel):
     vllm_tp: int
     vllm_mem_util: float
     train_gpus: list[int]
+    # Lowered below the defaults only when other processes already hold GPU memory.
+    regen_mem_util: float = REGEN_MEM_UTIL
+    eval_mem_util: float = EVAL_MEM_UTIL
 
     @property
     def regen_dp(self) -> int:
@@ -190,6 +197,74 @@ class PlanError(RuntimeError):
     pass
 
 
+# --------------------------------------------------------------------------- GPUs
+
+
+def mem_util_cap(gpu: GPU) -> float:
+    """Highest --gpu-memory-utilization vLLM can start with, given what others hold.
+
+    vLLM refuses to start unless util x total memory is free. Idle GPUs allow
+    more than the defaults, so this only bites on busy ones.
+    """
+    if gpu.memory_gb <= 0:
+        return 0.0
+    share = round((gpu.free_gb / gpu.memory_gb - 0.03) * 100, 6)
+    return max(0.0, math.floor(share) / 100)
+
+
+def usable_gb(gpu: GPU) -> float:
+    """Memory one GPU offers a plan: the headroom-limited total, or less if it is busy."""
+    return min(gpu.memory_gb * GPU_HEADROOM, mem_util_cap(gpu) * gpu.memory_gb)
+
+
+def gpu_budget(hw: Hardware) -> float:
+    return min((usable_gb(g) for g in hw.gpus), default=0.0)
+
+
+def is_busy(gpu: GPU) -> bool:
+    return gpu.memory_used_gb > max(1.0, 0.05 * gpu.memory_gb)
+
+
+def capped_util(util: float, hw: Hardware, gpus: list[int]) -> float:
+    """`util`, lowered if needed so vLLM can start on every one of `gpus`."""
+    caps = [mem_util_cap(g) for g in hw.gpus if g.index in gpus]
+    return round(min([util, *caps]), 2)
+
+
+def _describe(gpu: GPU) -> str:
+    busy = f", {gpu.memory_used_gb:g} GB in use" if is_busy(gpu) else ""
+    return f"GPU {gpu.index} ({gpu.name}, {gpu.memory_gb:g} GB{busy})"
+
+
+def select_gpus(hw: Hardware) -> tuple[Hardware, list[str]]:
+    """Drop GPUs far smaller (or busier) than the best one, and warn about busy ones.
+
+    Every GPU in a plan is sized like the smallest one, so a small display card
+    next to a big GPU would otherwise shrink the whole plan to fit the small card.
+    """
+    notes: list[str] = []
+    best = max((usable_gb(g) for g in hw.gpus), default=0.0)
+    keep = [g for g in hw.gpus if usable_gb(g) >= SMALL_GPU_RATIO * best]
+    dropped = [g for g in hw.gpus if g not in keep]
+    if dropped:
+        ids = ",".join(g.visible_id for g in keep)
+        notes.append(
+            f"Ignoring {', '.join(_describe(g) for g in dropped)}: much less memory is usable "
+            f"there than on the others. Planning with GPU {', '.join(str(g.index) for g in keep)}"
+            f". Set CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES={ids}) to pick GPUs yourself."
+        )
+        hw = hw.model_copy(update={"gpus": keep})
+    for g in keep:
+        if is_busy(g):
+            notes.append(
+                f"{_describe(g)} is partly used by another process. The plan only counts the "
+                f"{g.free_gb:.0f} GB that is free and, if needed, lowers vLLM's "
+                "--gpu-memory-utilization to fit; free the GPU (or exclude it with "
+                "CUDA_VISIBLE_DEVICES) for a faster run."
+            )
+    return hw, notes
+
+
 # --------------------------------------------------------------------------- estimates
 
 
@@ -262,9 +337,41 @@ def _round_down(x: float, step: int) -> int:
     return int(x // step * step)
 
 
-def _count_lines(path: Path) -> int:
+def count_conversations(path: Path) -> int:
+    """Conversations in a JSONL file, or in a JSON file holding one array of them.
+
+    `speculators regenerate-responses` reads local files with the Hugging Face
+    "json" loader, which takes both forms.
+    """
     with path.open("rb") as f:
-        return sum(1 for line in f if line.strip())
+        head = f.read(4096).removeprefix(b"\xef\xbb\xbf").lstrip()
+    if head.startswith(b"["):
+        try:
+            data = json.loads(path.read_bytes().decode("utf-8-sig"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise PlanError(
+                f"{path.name}: looks like a JSON array but isn't valid JSON ({e})."
+            ) from e
+        return len(data)
+    rows, first = 0, None
+    with path.open("rb") as f:
+        for line in f:
+            if line.strip():
+                rows += 1
+                first = first if first is not None else line
+    if first is None:
+        return 0
+    try:
+        ok = isinstance(json.loads(first.decode("utf-8-sig")), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        ok = False
+    if not ok:
+        raise PlanError(
+            f"{path.name}: expected one JSON object per line (JSONL) or a JSON array of "
+            "conversations, but the first line isn't a JSON object. Pretty-printed objects "
+            "aren't supported; write one conversation per line."
+        )
+    return rows
 
 
 def build_sources(
@@ -279,7 +386,10 @@ def build_sources(
             raise PlanError(f"Data file not found: {f}")
         if p.suffix.lower() not in (".jsonl", ".json"):
             raise PlanError(f"{p.name}: data files must be .jsonl or .json")
-        rows = _count_lines(p)
+        rows = count_conversations(p)
+        if rows == 0:
+            notes.append(f"Skipping {p.name}: the file is empty (no conversations in it).")
+            continue
         take = min(rows, remaining)
         if take <= 0:
             notes.append(f"Skipping {p.name}: the sample budget is already used up.")
@@ -316,14 +426,20 @@ def _layout(
     n, gpu_gb = hw.num_gpus, hw.min_gpu_gb
     v_need = vllm_need_gb(model, seq_len)
     t_need = train_need_gb(model, draft, seq_len)
-    budget = gpu_gb * GPU_HEADROOM
+    budget = gpu_budget(hw)
 
     tp = next((t for t in (1, 2, 4, 8) if t <= n and v_need / t <= budget), None)
     if tp is None:
+        busy = any(is_busy(g) for g in hw.gpus)
         raise PlanError(
             f"{model.name} needs about {v_need:.0f} GB to serve, more than "
-            f"{n} x {gpu_gb:.0f} GB GPUs can hold on one machine. Use a smaller or "
-            "quantized model, or more GPUs."
+            f"{n} x {gpu_gb:.0f} GB GPUs can hold on one machine"
+            + (
+                f" (about {budget:.0f} GB usable on each; other processes hold the rest)"
+                if busy
+                else ""
+            )
+            + ". Use a smaller or quantized model, or more GPUs."
         )
     all_gpus = [g.index for g in hw.gpus]
     regen_count = n // tp * tp
@@ -353,7 +469,7 @@ def _layout(
                 vllm_mem_util=0.9,
                 train_gpus=all_gpus,
             )
-        return layout, v_need, t_need
+        return _cap_utils(layout, hw), v_need, t_need
 
     if n - tp >= 1:
         # Give vLLM about half the GPUs (in whole TP groups), training the rest.
@@ -379,7 +495,18 @@ def _layout(
             vllm_mem_util=0.9,
             train_gpus=all_gpus,
         )
-    return layout, v_need, t_need
+    return _cap_utils(layout, hw), v_need, t_need
+
+
+def _cap_utils(layout: Layout, hw: Hardware) -> Layout:
+    """Lower vLLM memory shares where other processes already hold GPU memory."""
+    return layout.model_copy(
+        update={
+            "vllm_mem_util": capped_util(layout.vllm_mem_util, hw, layout.vllm_gpus),
+            "regen_mem_util": capped_util(REGEN_MEM_UTIL, hw, layout.regen_gpus),
+            "eval_mem_util": capped_util(EVAL_MEM_UTIL, hw, layout.regen_gpus[: layout.regen_tp]),
+        }
+    )
 
 
 def make_plan(
@@ -443,13 +570,17 @@ def make_plan(
     )
 
     if hw.num_gpus == 0:
+        if hw.gpu_problem:
+            raise PlanError(hw.gpu_problem)
         raise PlanError(
             "No NVIDIA GPU found. Run this on a machine with NVIDIA GPUs, or preview a plan "
             "with --gpus, e.g. `autodspark plan --model ... --gpus 1x80`."
         )
+    hw, gpu_notes = select_gpus(hw)
+    warnings.extend(gpu_notes)
 
     # Shrink anchors, then sequence length, until training fits in one GPU.
-    budget = hw.min_gpu_gb * GPU_HEADROOM
+    budget = gpu_budget(hw)
     seq_before_fit = seq
     layers_before_fit = draft.num_layers
     while train_need_gb(model, draft, seq) > budget:
@@ -501,7 +632,7 @@ def make_plan(
                     "shared_gpu": False,
                     "vllm_gpus": layout.regen_gpus,
                     "vllm_tp": layout.regen_tp,
-                    "vllm_mem_util": 0.9,
+                    "vllm_mem_util": capped_util(REGEN_MEM_UTIL, hw, layout.regen_gpus),
                     "train_gpus": [g.index for g in hw.gpus],
                 }
             )

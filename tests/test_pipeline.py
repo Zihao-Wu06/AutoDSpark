@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 
 import pytest
 from rich.console import Console
@@ -261,3 +264,167 @@ def test_find_drafter_keeps_best_symlink(tmp_path):
     (tmp_path / "0" / "config.json").write_text("{}")
     (tmp_path / "checkpoint_best").symlink_to("0")
     assert pl.find_drafter(tmp_path) == (tmp_path / "checkpoint_best").absolute()
+
+
+def _write_jsonl(path, n):
+    path.write_text("".join(json.dumps({"prompt": f"q{i}"}) + "\n" for i in range(n)))
+    return path
+
+
+def test_stage_hashes_follow_file_contents(model_dir, tmp_path):
+    model = model_dir("qwen3-0.6b")
+    (model / "model.safetensors").write_bytes(b"x" * 100)
+    data = _write_jsonl(tmp_path / "mine.jsonl", 50)
+    plan = make_plan(inspect_model(str(model)), simulated("1x24"), "quick", data_files=[str(data)])
+    base = pl.stage_hashes(plan)
+    assert pl.stage_hashes(plan) == base  # stable: resuming an unchanged run skips stages
+
+    _write_jsonl(data, 51)  # data file edited in place
+    edited = pl.stage_hashes(plan)
+    assert edited["regen"] != base["regen"]
+
+    (model / "model.safetensors").write_bytes(b"y" * 200)  # fine-tune re-saved in place
+    resaved = pl.stage_hashes(plan)
+    assert resaved["regen"] != edited["regen"]
+
+    cfg = json.loads((model / "config.json").read_text())
+    cfg["rope_theta"] = 1
+    (model / "config.json").write_text(json.dumps(cfg))
+    assert pl.stage_hashes(plan)["regen"] != resaved["regen"]
+
+
+def test_hub_model_is_fingerprinted_by_id(setup):
+    plan, *_ = setup
+    hub = plan.model.model_copy(update={"path": "Qwen/Qwen3-8B", "is_local": False})
+    assert pl.model_fingerprint(hub) == "Qwen/Qwen3-8B"
+
+
+def test_old_or_broken_state_file_does_not_crash(setup, monkeypatch):
+    plan, rt, workdir, console = setup
+    workdir.mkdir(parents=True)
+    # state.json from an older version: hashes no longer match, so stages rerun
+    old = {"stages": {"regen": {"status": "done", "hash": "0123456789abcdef", "info": {}}}}
+    (workdir / "state.json").write_text(json.dumps(old))
+    p = pl.Pipeline(plan, rt, workdir, console)
+    ran = []
+    for stage in p.stages():
+        monkeypatch.setattr(p, f"_stage_{stage}", lambda s=stage: ran.append(s) or {})
+    p.run()
+    assert ran == p.stages()
+    (workdir / "state.json").write_text("{not json")
+    assert pl.State(workdir / "state.json").get("regen") is None
+
+
+def test_unknown_from_stage_lists_valid_stages(setup):
+    plan, rt, workdir, console = setup
+    with pytest.raises(ValueError, match="stages are: regen, prepare, train"):
+        pl.Pipeline(plan, rt, workdir, console).run(from_stage="hidden")
+
+
+def _oom_exec(workdir):
+    def fake_exec(cmd, log_name, grace=None):
+        log = workdir / "logs" / log_name
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as f:
+            f.write("torch.OutOfMemoryError: CUDA out of memory.\n")
+        raise StepFailed("train failed", log)
+
+    return fake_exec
+
+
+def test_oom_message_after_retries(setup, monkeypatch):
+    plan, rt, workdir, console = setup
+    plan.draft.max_anchors = 4096
+    p = pl.Pipeline(plan, rt, workdir, console, max_oom_retries=2)
+    monkeypatch.setattr(p, "_exec", _oom_exec(workdir))
+    monkeypatch.setattr(p, "_server", lambda *a, **k: __import__("contextlib").nullcontext())
+    with pytest.raises(StepFailed) as e:
+        p._stage_train()
+    msg = str(e.value)
+    assert "after 2 retries" in msg and "last tried 1024" in msg
+    assert "other processes using the GPU" in msg and "DataLoader" in msg
+    assert '"--gradient-checkpointing", "--num-workers", "2"' in msg
+
+
+def test_oom_message_when_nothing_was_shrunk(setup, monkeypatch):
+    plan, rt, workdir, console = setup
+    plan.draft.max_anchors = 300
+    p = pl.Pipeline(plan, rt, workdir, console)
+    monkeypatch.setattr(p, "_exec", _oom_exec(workdir))
+    monkeypatch.setattr(p, "_server", lambda *a, **k: __import__("contextlib").nullcontext())
+    with pytest.raises(StepFailed) as e:
+        p._stage_train()
+    msg = str(e.value)
+    assert "even after shrinking" not in msg and "retries" not in msg
+    assert "max_anchors=300" in msg and "too small to shrink" in msg
+
+
+def test_online_train_clears_leftover_hidden_states(setup, monkeypatch):
+    plan, rt, workdir, console = setup
+    assert plan.layout.mode == "online"
+    p = pl.Pipeline(plan, rt, workdir, console)
+    leftover = workdir / "hs_stream" / "old" / "hs_0.safetensors"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_text("from a crashed run")
+
+    def fake_train(cmd, log_name, grace=None):
+        assert not any((workdir / "hs_stream").iterdir())
+        (workdir / "checkpoints" / "0").mkdir(parents=True)
+        (workdir / "checkpoints" / "0" / "config.json").write_text("{}")
+
+    monkeypatch.setattr(p, "_exec", fake_train)
+    monkeypatch.setattr(p, "_server", lambda *a, **k: __import__("contextlib").nullcontext())
+    p._stage_train()
+    assert not leftover.exists()
+
+
+def test_eval_without_drafter_fails_clearly(setup):
+    plan, rt, workdir, console = setup
+    p = pl.Pipeline(plan, rt, workdir, console)
+    p.state.data["stages"]["train"] = {"info": {"drafter": str(workdir / "gone")}}
+    assert p._drafter() is None  # recorded path no longer exists
+    with pytest.raises(StepFailed, match="No trained drafter"):
+        p._stage_eval()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="flock is POSIX only")
+def test_workdir_lock_is_exclusive_and_dies_with_its_process(tmp_path):
+    lock = tmp_path / "run" / ".lock"
+    with pl.WorkdirLock(lock), pytest.raises(pl.WorkdirBusy, match=f"pid {os.getpid()}"):
+        pl.WorkdirLock(lock).__enter__()
+    with pl.WorkdirLock(lock):  # released on exit
+        pass
+    # A holder that is killed (no cleanup at all) must not block the next run.
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, os, sys, time; fd = os.open(sys.argv[1], os.O_RDWR);"
+            "fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(60)",
+            str(lock),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "locked"
+    with pytest.raises(pl.WorkdirBusy):
+        pl.WorkdirLock(lock).__enter__()
+    holder.kill()
+    holder.wait()
+    with pl.WorkdirLock(lock):
+        pass
+
+
+def test_workdir_lock_runs_unlocked_when_locking_is_unsupported(tmp_path, monkeypatch):
+    """ENOLCK & co. (e.g. Lustre without flock) must not be reported as "busy" forever."""
+    import errno
+    import fcntl
+
+    from autodspark.pipeline import WorkdirLock
+
+    def no_locks(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    with WorkdirLock(tmp_path / ".lock"):
+        pass

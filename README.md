@@ -86,7 +86,8 @@ You need a Linux machine with an NVIDIA GPU and your model in Hugging Face forma
 
 ```bash
 git clone https://github.com/Zihao-Wu06/AutoDSpark.git && cd AutoDSpark
-pip install -e . && autodspark setup                    # one-time install
+uv venv && . .venv/bin/activate && uv pip install -e .  # needs uv: https://docs.astral.sh/uv/
+autodspark setup                                        # one-time install
 autodspark run --model Qwen/Qwen3-8B --preset medium    # train, test, report
 ```
 

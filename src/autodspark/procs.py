@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -64,15 +65,72 @@ def _env(cmd: Cmd) -> dict[str, str]:
     return env
 
 
+def _say(console: Console, message: str) -> None:
+    """Print a status line, but never let a broken terminal stop cleanup.
+
+    After an ssh drop (SIGHUP) or with a closed pipe, writing to the terminal
+    raises EIO/EPIPE. Status lines are nice to have; stopping GPU processes is not
+    optional, so output errors are swallowed here.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        console.print(message)
+
+
+def _write_out(text: str) -> bool:
+    """Echo subprocess output; False once the terminal is gone."""
+    try:
+        sys.stdout.write(text)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _raise_interrupt(signum, frame):  # noqa: ARG001
     raise KeyboardInterrupt
 
 
+# Signals that mean "stop": Ctrl+C, `kill`, and a hung-up terminal (ssh drop).
+STOP_SIGNALS = tuple(
+    s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)) if s is not None
+)
+_HAS_PROCESS_GROUPS = hasattr(os, "killpg")  # POSIX only; not on Windows
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
 def install_signal_handlers() -> None:
     """Treat SIGTERM/SIGHUP (e.g. a dropped ssh session) like Ctrl+C, so servers get stopped."""
-    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
-        if sig is not None:
-            signal.signal(sig, _raise_interrupt)
+    for sig in STOP_SIGNALS:
+        if sig == signal.SIGINT:  # SIGINT already raises KeyboardInterrupt
+            continue
+        if signal.getsignal(sig) == signal.SIG_IGN:
+            continue  # e.g. SIGHUP under nohup: the user asked to survive a hangup
+        signal.signal(sig, _raise_interrupt)
+
+
+@contextlib.contextmanager
+def interrupts_deferred():
+    """Hold off Ctrl+C/SIGTERM/SIGHUP while the block runs; re-raise afterwards.
+
+    Used around the final SIGKILL so that pressing Ctrl+C again (or a SIGHUP
+    arriving while we stop things) can't leave processes holding the GPUs.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    got: list[int] = []
+    old = {}
+    for sig in STOP_SIGNALS:
+        if signal.getsignal(sig) == signal.SIG_IGN:
+            continue  # e.g. SIGINT in a background job: stays ignored
+        with contextlib.suppress(ValueError, OSError):
+            old[sig] = signal.signal(sig, lambda signum, frame: got.append(signum))
+    try:
+        yield
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+    if got:
+        raise KeyboardInterrupt
 
 
 def _group_alive(pgid: int) -> bool:
@@ -85,29 +143,56 @@ def _group_alive(pgid: int) -> bool:
     return True
 
 
+def _alive(proc: subprocess.Popen) -> bool:
+    if _HAS_PROCESS_GROUPS:
+        return _group_alive(proc.pid)
+    return proc.poll() is None
+
+
+def _signal_group(proc: subprocess.Popen, *, force: bool) -> None:
+    if not _HAS_PROCESS_GROUPS:
+        with contextlib.suppress(OSError):
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, _SIGKILL if force else signal.SIGTERM)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    if _alive(proc):
+        _signal_group(proc, force=True)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
+    deadline = time.monotonic() + 15
+    while _alive(proc) and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+
 def terminate_group(proc: subprocess.Popen, grace: float = SERVER_STOP_GRACE) -> None:
     """Stop a child and every process in its group (vLLM engine and TP workers).
 
     Children are started with start_new_session=True, so the group id is the
     child's pid. We signal the group even if the parent already exited, and
     wait until the whole group is gone so GPUs are free for the next step.
+
+    SIGTERM first, then SIGKILL after `grace` seconds. If the grace wait is
+    interrupted (a second Ctrl+C, SIGHUP, ...), the group is SIGKILLed at once
+    and the interrupt propagates; the SIGKILL itself can't be interrupted.
     """
-    pgid = proc.pid
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGTERM)
-    deadline = time.time() + grace
-    while time.time() < deadline:
-        proc.poll()  # reap the parent so it doesn't linger as a zombie
-        if not _group_alive(pgid):
-            return
-        time.sleep(0.5)
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=10)
-    deadline = time.time() + 15
-    while _group_alive(pgid) and time.time() < deadline:
-        time.sleep(0.5)
+    try:
+        _signal_group(proc, force=False)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            proc.poll()  # reap the parent so it doesn't linger as a zombie
+            if not _alive(proc):
+                return
+            time.sleep(0.5)
+    finally:
+        with interrupts_deferred():
+            _kill_group(proc)
 
 
 def run(
@@ -115,7 +200,7 @@ def run(
 ) -> None:
     """Run a command to completion, teeing output to `log`. Raises StepFailed."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    console.print(f"[bold cyan]>[/] {cmd.label}  [dim](log: {log})[/]")
+    _say(console, f"[bold cyan]>[/] {cmd.label}  [dim](log: {log})[/]")
     with log.open("a", encoding="utf-8") as f:
         f.write(f"\n$ {cmd.shell()}\n")
         f.flush()
@@ -132,12 +217,16 @@ def run(
             assert proc.stdout is not None
             for line in proc.stdout:
                 f.write(line)
-                if echo:
-                    sys.stdout.write(line)
+                if echo and not _write_out(line):
+                    echo = False  # terminal gone; keep training, the log has everything
             code = proc.wait()
-        except KeyboardInterrupt:
-            console.print(f"  stopping {cmd.label} (up to {grace:.0f}s)...")
-            terminate_group(proc, grace)
+        except BaseException:
+            # Ctrl+C, SIGTERM/SIGHUP (see install_signal_handlers), or any error
+            # here: the child must not outlive us holding GPUs and ports.
+            try:
+                _say(console, f"  stopping {cmd.label} (up to {grace:.0f}s)...")
+            finally:
+                terminate_group(proc, grace)
             raise
         # Leftover children (e.g. dataloader workers) must not hold GPUs.
         terminate_group(proc, grace=10)
@@ -170,7 +259,7 @@ class VllmServer:
                 "left over from an earlier run), or change `ports` in plan.yaml."
             )
         self.log.parent.mkdir(parents=True, exist_ok=True)
-        self.console.print(f"[bold cyan]>[/] starting {self.cmd.label}  [dim](log: {self.log})[/]")
+        _say(self.console, f"[bold cyan]>[/] starting {self.cmd.label}  [dim](log: {self.log})[/]")
         with self.log.open("a", encoding="utf-8") as f:
             f.write(f"\n$ {self.cmd.shell()}\n")
             f.flush()
@@ -201,7 +290,7 @@ class VllmServer:
             try:
                 r = httpx.get(f"{self.url}/health", timeout=5, trust_env=False)
                 if r.status_code == 200:
-                    self.console.print(f"  ready on {self.url} after {time.time() - start:.0f}s")
+                    _say(self.console, f"  ready on {self.url} after {time.time() - start:.0f}s")
                     return
             except httpx.HTTPError:
                 pass
@@ -213,7 +302,10 @@ class VllmServer:
         )
 
     def __exit__(self, *exc) -> None:
-        if self.proc is not None:
-            self.console.print(f"  stopping {self.cmd.label}")
-            terminate_group(self.proc)
-            self.proc = None
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            _say(self.console, f"  stopping {self.cmd.label}")
+        finally:
+            terminate_group(proc)

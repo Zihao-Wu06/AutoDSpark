@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from typing import Annotated
 
@@ -12,7 +15,16 @@ from rich.table import Table
 
 from . import SPECULATORS_VERSION, __version__, commands, hardware
 from .model_info import ModelInfoError, inspect_model
-from .pipeline import STAGES, Paths, Pipeline, State, find_drafter
+from .pipeline import (
+    STAGES,
+    Paths,
+    Pipeline,
+    State,
+    WorkdirBusy,
+    WorkdirLock,
+    find_drafter,
+    stages_for,
+)
 from .planner import DEFAULT_PUBLIC_DATASET, PRESETS, Plan, PlanError, make_plan
 from .procs import StepFailed, install_signal_handlers
 from .runtime import (
@@ -74,6 +86,36 @@ HomeOpt = Annotated[Path | None, typer.Option(help="Where AutoDSpark keeps its e
 
 def _runtime(home: Path | None) -> Runtime:
     return Runtime.resolve(home=home)
+
+
+def _is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def _require_linux(what: str) -> None:
+    if not _is_linux():
+        console.print(
+            f"[red]{what} needs Linux with NVIDIA GPUs[/] (this is {sys.platform}). On this "
+            "machine you can still preview: `autodspark plan --gpus 1x80 ...` or "
+            "`autodspark run --dry-run --gpus 1x80 ...`."
+        )
+        raise typer.Exit(2)
+
+
+def _resume_hint(workdir: Path) -> str:
+    return f"autodspark run --workdir {shlex.quote(str(workdir))}"
+
+
+def _say(message: str) -> None:
+    """Print, unless the terminal is gone (e.g. after an ssh drop)."""
+    with contextlib.suppress(OSError, ValueError):
+        console.print(message)
+
+
+def _model_ref(model: str) -> str:
+    """`--model` as the planner records it: a resolved local folder, else the Hub id."""
+    local = Path(model).expanduser()
+    return str(local.resolve()) if local.is_dir() else model
 
 
 def _default_workdir(model: str, preset: str) -> Path:
@@ -188,7 +230,7 @@ def _fail(e: StepFailed, workdir: Path) -> None:
         console.print(e.tail, markup=False, highlight=False)
     if e.log:
         console.print(f"Full log: {e.log}")
-    console.print(f"Fix the problem, then resume with: autodspark run --workdir {workdir}")
+    console.print(f"Fix the problem, then resume with: {_resume_hint(workdir)}")
 
 
 # --------------------------------------------------------------------------- commands
@@ -202,6 +244,8 @@ def setup(
     dry_run: Annotated[bool, typer.Option(help="Only print the commands.")] = False,
 ) -> None:
     """Create the Speculators and vLLM environments (needs uv)."""
+    if not dry_run:
+        _require_linux("Setup")
     rt = _runtime(home)
     cmds = setup_commands(rt, vllm, python)
     missing = missing_setup_tools()
@@ -261,6 +305,7 @@ def doctor(
         hw.num_gpus > 0,
         "NVIDIA GPUs",
         ", ".join(f"{g.index}: {g.name} {g.memory_gb:g} GB" for g in hw.gpus)
+        or hw.gpu_problem
         or "none found (nvidia-smi missing or no GPUs)",
     )
     if hw.driver_version:
@@ -281,7 +326,9 @@ def doctor(
         )
     rt = _runtime(home)
     for name, good, detail in rt.check():
-        row(good, name, detail)
+        # A passing check can still carry a warning (e.g. an untested vLLM version).
+        warn = good and "warning:" in detail
+        row(good and not warn, name, detail, warn_only=warn)
     if rt.vllm_python.exists():
         good, detail = flashinfer_status(rt)
         row(good, "FlashInfer kernels", detail)
@@ -346,9 +393,7 @@ def plan(
     print_plan(p)
     path = Paths(workdir).plan
     p.save(path)
-    console.print(
-        f"\nSaved to {path}. Edit it if you like, then: autodspark run --workdir {workdir}"
-    )
+    console.print(f"\nSaved to {path}. Edit it if you like, then: {_resume_hint(workdir)}")
 
 
 @app.command(name="run")
@@ -358,7 +403,10 @@ def run_cmd(
         Path | None, typer.Option("--plan", help="Use an existing plan.yaml.")
     ] = None,
     workdir: WorkdirOpt = None,
-    preset: PresetOpt = "standard",
+    preset: Annotated[
+        str | None,
+        typer.Option(help=f"How much training to do: {', '.join(PRESETS)} (default: standard)."),
+    ] = None,
     data: DataOpt = None,
     public_data: PublicOpt = DEFAULT_PUBLIC_DATASET,
     gpus: GpusOpt = None,
@@ -385,29 +433,115 @@ def run_cmd(
     if gpus and not dry_run:
         console.print("[red]--gpus is only for planning and --dry-run.[/]")
         raise typer.Exit(2)
+    if not dry_run:
+        _require_linux("Training")
 
     if model and not workdir and not plan_file:
-        workdir = _default_workdir(model, preset)
-    existing = Paths(workdir).plan if workdir is not None else None
-    if plan_file is None and existing is not None and existing.exists() and not replan:
+        workdir = _default_workdir(model, preset or "standard")
+    if workdir is None and plan_file is not None:
+        workdir = plan_file.parent
+    if workdir is None:
+        console.print("[red]Pass --model, --plan, or --workdir of an earlier run.[/]")
+        raise typer.Exit(2)
+
+    # One run per work folder; status, serve and --dry-run don't take the lock.
+    try:
+        lock = contextlib.nullcontext() if dry_run else WorkdirLock(Paths(workdir).lock)
+        with lock:
+            _run(
+                model=model,
+                plan_file=plan_file,
+                workdir=workdir,
+                preset=preset,
+                data=data,
+                public_data=public_data,
+                gpus=gpus,
+                samples=samples,
+                epochs=epochs,
+                seq_len=seq_len,
+                draft_layers=draft_layers,
+                eval_prompts=eval_prompts,
+                trust_remote_code=trust_remote_code,
+                from_stage=from_stage,
+                dry_run=dry_run,
+                replan=replan,
+                yes=yes,
+                quiet=quiet,
+                home=home,
+            )
+    except WorkdirBusy as e:
+        console.print(f"[red]{e}[/]")
+        raise typer.Exit(1) from e
+
+
+def _check_saved_plan(p: Plan, plan_file: Path, model: str | None, preset: str | None) -> None:
+    """Refuse to silently train for a different model or preset than the saved plan."""
+    problems = []
+    if model and _model_ref(model) != p.model.path:
+        problems.append(f"--model {model} (the plan is for {p.model.path})")
+    if preset and preset != p.preset:
+        problems.append(f"--preset {preset} (the plan uses {p.preset})")
+    if problems:
+        console.print(
+            f"[red]{plan_file} was made for something else:[/] {'; '.join(problems)}.\n"
+            "Pass --replan to plan again in this folder (earlier results are moved aside), "
+            "or use a different --workdir."
+        )
+        raise typer.Exit(2)
+
+
+def _run(
+    *,
+    model: str | None,
+    plan_file: Path | None,
+    workdir: Path,
+    preset: str | None,
+    data: list[str] | None,
+    public_data: str,
+    gpus: str | None,
+    samples: int | None,
+    epochs: int | None,
+    seq_len: int | None,
+    draft_layers: int | None,
+    eval_prompts: str | None,
+    trust_remote_code: bool | None,
+    from_stage: str | None,
+    dry_run: bool,
+    replan: bool,
+    yes: bool,
+    quiet: bool,
+    home: Path | None,
+) -> None:
+    existing = Paths(workdir).plan
+    if plan_file is None and existing.exists() and not replan:
         # Resuming: keep the saved plan (and any edits to it) instead of re-planning.
         plan_file = existing
-        shaping = [data, samples, epochs, seq_len, draft_layers, eval_prompts, gpus]
-        if any(v is not None for v in shaping) or public_data != DEFAULT_PUBLIC_DATASET:
+        given = {
+            "--data": data,
+            "--public-data": None if public_data == DEFAULT_PUBLIC_DATASET else public_data,
+            "--samples": samples,
+            "--epochs": epochs,
+            "--seq-len": seq_len,
+            "--draft-layers": draft_layers,
+            "--eval-prompts": eval_prompts,
+            "--gpus": gpus,
+            "--trust-remote-code": trust_remote_code,
+        }
+        ignored = [flag for flag, v in given.items() if v is not None]
+        if ignored:
             console.print(
-                f"[yellow]note:[/] using the existing {existing}; plan options on the command "
-                "line are ignored. Pass --replan to rebuild it."
+                f"[yellow]note:[/] using the existing {existing}; {', '.join(ignored)} "
+                "ignored. Pass --replan to rebuild it."
             )
     if plan_file is not None:
         p = Plan.load(plan_file)
-        workdir = workdir or plan_file.parent
-        if plan_file.resolve() != Paths(workdir).plan.resolve():
-            p.save(Paths(workdir).plan)
+        _check_saved_plan(p, plan_file, model, preset)
+        if plan_file.resolve() != existing.resolve():
+            p.save(existing)
     elif model:
-        workdir = workdir or _default_workdir(model, preset)
         p = _build_plan(
             model,
-            preset,
+            preset or "standard",
             data,
             public_data,
             workdir,
@@ -419,12 +553,20 @@ def run_cmd(
             eval_prompts,
             trust_remote_code,
         )
-        p.save(Paths(workdir).plan)
+        p.save(existing)
     else:
-        console.print("[red]Pass --model, --plan, or --workdir of an earlier run.[/]")
+        console.print(f"[red]No plan.yaml in {workdir}.[/] Pass --model to plan a new run.")
         raise typer.Exit(2)
 
     print_plan(p)
+    valid = stages_for(p)
+    if from_stage is not None and from_stage not in valid:
+        extra = " (it only exists in offline mode)" if from_stage == "hidden" else ""
+        console.print(
+            f"[red]Unknown --from-stage {from_stage!r}{extra}.[/] Stages in this plan: "
+            f"{', '.join(valid)}."
+        )
+        raise typer.Exit(2)
     problems = p.problems()
     for prob in problems:
         console.print(f"[red]plan.yaml problem:[/] {prob}")
@@ -444,14 +586,14 @@ def run_cmd(
 
     pipe = Pipeline(p, rt, workdir, console, dry_run=dry_run, echo=not quiet)
     if not dry_run:
-        install_signal_handlers()
+        install_signal_handlers()  # SIGTERM/SIGHUP stop child processes like Ctrl+C
     try:
         pipe.run(from_stage=from_stage)
     except StepFailed as e:
         _fail(e, workdir)
         raise typer.Exit(1) from e
     except KeyboardInterrupt:
-        console.print(f"\nStopped. Resume with: autodspark run --workdir {workdir}")
+        _say(f"\nStopped. Resume with: {_resume_hint(workdir)}")
         raise typer.Exit(130) from None
     if not dry_run:
         console.print(f"\n[green bold]All done.[/] See {Paths(workdir).report_dir / 'report.md'}")
@@ -485,13 +627,26 @@ def status(workdir: Annotated[Path, typer.Option(help="Run folder.")]) -> None:
 def serve(workdir: Annotated[Path, typer.Option(help="Run folder.")]) -> None:
     """Print the vLLM command that serves your model with the trained drafter."""
     paths = Paths(workdir)
+    if not paths.plan.exists():
+        console.print(f"[red]No plan.yaml in {workdir}.[/]")
+        raise typer.Exit(2)
     p = Plan.load(paths.plan)
-    rec = (State(paths.state).get("train") or {}).get("info", {})
-    drafter = find_drafter(paths.checkpoints) or (
-        Path(rec["drafter"]) if rec.get("drafter") else None
-    )
+    rec = (State(paths.state).get("train") or {}).get("info") or {}
+    drafter = find_drafter(paths.checkpoints)
+    if drafter is None and rec.get("drafter"):
+        recorded = Path(rec["drafter"])
+        if not (recorded / "config.json").exists():
+            console.print(
+                f"[red]The drafter recorded in state.json ({recorded}) is gone.[/] Train again "
+                f"with: {_resume_hint(workdir)} --from-stage train"
+            )
+            raise typer.Exit(2)
+        drafter = recorded
     if drafter is None:
-        console.print("[red]No trained drafter found yet. Run training first.[/]")
+        console.print(
+            f"[red]No trained drafter found yet in {paths.checkpoints}.[/] Run training first: "
+            f"{_resume_hint(workdir)}"
+        )
         raise typer.Exit(2)
     for title, cmd in commands.serve_commands(p, drafter):
         console.print(f"[bold]{title}:[/]")

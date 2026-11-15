@@ -230,3 +230,120 @@ def test_medium_preset(info):
     assert p.data.max_samples == 10000
     assert p.train.epochs == 3
     assert p.data.seq_len == 2048
+
+
+def _hw(*gpus):
+    """gpus: (memory_gb, memory_used_gb) pairs."""
+    from autodspark.hardware import GPU, Hardware
+
+    return Hardware(
+        gpus=[
+            GPU(index=i, name=f"gpu{i}", memory_gb=mem, memory_used_gb=used)
+            for i, (mem, used) in enumerate(gpus)
+        ],
+        disk_free_gb=2000,
+    )
+
+
+def test_small_display_gpu_is_ignored(info):
+    p = make_plan(info("qwen3-8b"), _hw((2.0, 0.3), (24.0, 0.0)), "quick")
+    assert [g.index for g in p.hardware.gpus] == [1]
+    assert p.layout.regen_gpus == p.layout.train_gpus == [1]
+    note = next(w for w in p.warnings if "Ignoring" in w)
+    assert "GPU 0 (gpu0, 2 GB)" in note
+    assert "CUDA_VISIBLE_DEVICES=1" in note
+    assert not p.problems()
+
+
+def test_similar_gpus_all_kept(info):
+    p = make_plan(info("qwen3-8b"), _hw((80.0, 0.0), (48.0, 0.0)), "standard")
+    assert len(p.hardware.gpus) == 2
+    assert not any("Ignoring" in w for w in p.warnings)
+
+
+def test_homogeneous_idle_gpus_unchanged(info):
+    p = make_plan(info("qwen3-8b"), simulated("2x80"), "standard")
+    assert p.layout.regen_mem_util == 0.9
+    assert p.layout.eval_mem_util == 0.85
+    assert p.layout.vllm_mem_util == 0.9
+    assert not any("Ignoring" in w or "partly used" in w for w in p.warnings)
+
+
+def test_busy_gpu_caps_vllm_memory(info):
+    from autodspark.planner import mem_util_cap
+
+    hw = _hw((80.0, 30.0), (80.0, 0.0))
+    p = make_plan(info("qwen3-8b"), hw, "standard")
+    cap = mem_util_cap(hw.gpus[0])
+    assert cap * 80 <= 50  # what's free on GPU 0
+    assert p.layout.regen_mem_util == cap  # regen runs on both GPUs
+    assert p.layout.eval_mem_util == min(0.85, cap)
+    assert p.layout.vllm_mem_util <= cap
+    assert any("GPU 0" in w and "partly used" in w for w in p.warnings)
+    assert not any("GPU 1" in w for w in p.warnings)
+
+
+def test_almost_full_gpu_is_ignored_in_favour_of_idle_ones(info):
+    p = make_plan(info("qwen3-8b"), _hw((80.0, 75.0), (80.0, 0.0), (80.0, 0.0)), "standard")
+    assert [g.index for g in p.hardware.gpus] == [1, 2]
+    assert p.layout.regen_mem_util == 0.9
+
+
+def test_gpu_problem_is_a_plan_error(info):
+    from autodspark.hardware import Hardware
+
+    with pytest.raises(PlanError, match="MIG"):
+        make_plan(info("qwen3-0.6b"), Hardware(gpu_problem="MIG is enabled on GPU 0."), "quick")
+
+
+def test_old_plan_yaml_loads_with_defaults(info, tmp_path):
+    import yaml
+
+    p = make_plan(info("qwen3-0.6b"), simulated("1x24"), "quick")
+    data = p.model_dump(mode="json")
+    for key in ("regen_mem_util", "eval_mem_util"):
+        del data["layout"][key]
+    for g in data["hardware"]["gpus"]:
+        for key in ("memory_used_gb", "uuid", "cuda_id"):
+            del g[key]
+    del data["hardware"]["gpu_problem"]
+    path = tmp_path / "plan.yaml"
+    path.write_text(yaml.safe_dump(data))
+    q = Plan.load(path)
+    assert q.layout.regen_mem_util == 0.9 and q.layout.eval_mem_util == 0.85
+    assert q.model_dump() == p.model_dump()
+
+
+def test_json_array_counts_elements(info, tmp_path):
+    one_line = tmp_path / "one.json"
+    one_line.write_text(json.dumps([{"prompt": f"q{i}"} for i in range(5000)]))
+    p = make_plan(
+        info("qwen3-0.6b"),
+        simulated("1x24"),
+        "quick",
+        data_files=[str(one_line)],
+        public_data="none",
+    )
+    assert p.data.sources[0].limit == 1000  # 5000 rows, capped by the quick budget
+
+    pretty = tmp_path / "pretty.json"
+    pretty.write_text(json.dumps([{"messages": [{"role": "user", "content": "hi"}]}] * 3, indent=2))
+    p = make_plan(info("qwen3-0.6b"), simulated("1x24"), "quick", data_files=[str(pretty)])
+    assert p.data.sources[0].limit == 3
+
+
+def test_pretty_printed_object_rejected(info, tmp_path):
+    f = tmp_path / "obj.json"
+    f.write_text(json.dumps({"messages": [{"role": "user", "content": "hi"}]}, indent=2))
+    with pytest.raises(PlanError, match="one JSON object per line"):
+        make_plan(info("qwen3-0.6b"), simulated("1x24"), "quick", data_files=[str(f)])
+
+
+@pytest.mark.parametrize("content", ["", "\n\n", "[]"])
+def test_empty_data_file_says_so(info, tmp_path, content):
+    f = tmp_path / "empty.json"
+    f.write_text(content)
+    p = make_plan(info("qwen3-0.6b"), simulated("1x24"), "quick", data_files=[str(f)])
+    assert any("empty.json" in w and "empty" in w.split(":", 1)[1] for w in p.warnings)
+    assert not any("budget" in w for w in p.warnings)
+    assert [s.kind for s in p.data.sources] == ["preset"]

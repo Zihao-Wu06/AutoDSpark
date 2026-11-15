@@ -49,6 +49,16 @@ def _advice(plan: Plan, speedup: float | None) -> list[str]:
     return out
 
 
+def _sharing(plan: Plan) -> str:
+    lay = plan.layout
+    if not lay.shared_gpu:
+        return ""
+    shared = sorted(set(lay.vllm_gpus) & set(lay.train_gpus)) or lay.train_gpus
+    if len(shared) <= 1:
+        return " (vLLM and training share one GPU)"
+    return f" (each of the {len(shared)} GPUs ran a vLLM replica and a training rank)"
+
+
 def render(plan: Plan, drafter: Path | None, eval_result: dict | None) -> str:
     m, d, lay = plan.model, plan.draft, plan.layout
     lines = [
@@ -97,7 +107,7 @@ def render(plan: Plan, drafter: Path | None, eval_result: dict | None) -> str:
         f"- Target model: `{m.path}` ({m.num_layers} layers, hidden {m.hidden_size}, "
         f"vocab {m.vocab_size}, {m.size_label})",
         f"- GPUs: {plan.hardware.num_gpus} x {plan.hardware.min_gpu_gb:g} GB, "
-        f"{lay.mode} mode" + (" (vLLM and training share one GPU)" if lay.shared_gpu else ""),
+        f"{lay.mode} mode{_sharing(plan)}",
         f"- Data: {plan.data.max_samples:,} samples, sequence length {plan.data.seq_len}, "
         "sources: " + ", ".join(f"{s.value} ({s.limit:,})" for s in plan.data.sources),
         f"- Drafter: {d.num_layers} layers, block size {d.block_size}, target layers "

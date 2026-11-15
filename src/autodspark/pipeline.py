@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
+import os
 import re
+import shutil
 from pathlib import Path
 
 import httpx
@@ -51,17 +54,119 @@ class Paths:
         self.hs_cache = workdir / "hidden_states"
         self.checkpoints = workdir / "checkpoints"
         self.report_dir = workdir / "report"
+        self.lock = workdir / ".lock"
+
+
+class WorkdirBusy(RuntimeError):
+    """Another `autodspark run` holds this work folder."""
+
+
+class WorkdirLock:
+    """An exclusive lock on a work folder for the lifetime of a run.
+
+    Uses flock(2), so the kernel drops the lock when the process dies, however
+    it dies; a stale lock file left on disk never blocks a later run. Where
+    flock isn't available (Windows) this is a no-op.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> WorkdirLock:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - not POSIX
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                # Locking unsupported here (e.g. Lustre without -o flock, some NFS):
+                # run unlocked rather than refuse forever.
+                os.close(fd)
+                return self
+            holder = ""
+            with contextlib.suppress(OSError, ValueError):
+                holder = os.pread(fd, 64, 0).decode().strip()
+            os.close(fd)
+            raise WorkdirBusy(
+                f"Another autodspark run is already using {self.path.parent}"
+                + (f" (pid {holder})" if holder else "")
+                + ". Wait for it to finish or stop it, or use a different --workdir."
+            ) from e
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+        self._fd = fd
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._fd is not None:
+            os.close(self._fd)  # closing releases the flock
+            self._fd = None
 
 
 def _digest(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
+# Files up to this size are fingerprinted by content; bigger ones by size + mtime.
+SMALL_FILE_BYTES = 1 << 20
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
+_MODEL_TEXT_FILES = ("config.json", "tokenizer_config.json", "chat_template.jinja")
+
+
+def file_fingerprint(path: str | Path) -> dict:
+    """Cheap, stable identity of a file's contents (changes if it is edited in place)."""
+    p = Path(path).expanduser()
+    try:
+        st = p.stat()
+        if st.st_size <= SMALL_FILE_BYTES:
+            return {"size": st.st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+    except OSError:
+        return {"missing": True}
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def model_fingerprint(model) -> str | dict:
+    """A Hub id stays as is; a local folder adds its config and weight files.
+
+    Re-saving a fine-tune into the same folder changes config.json and/or the
+    weight files' sizes and mtimes, so every stage reruns.
+    """
+    root = Path(model.path)
+    if not (model.is_local or root.is_absolute()):
+        return model.path
+    if not root.is_dir():
+        return {"missing": True}
+    texts = {name: file_fingerprint(root / name) for name in _MODEL_TEXT_FILES}
+    weights = {}
+    for f in sorted(root.iterdir()):
+        if f.name.endswith(_WEIGHT_SUFFIXES) or f.name.endswith(".index.json"):
+            with contextlib.suppress(OSError):
+                st = f.stat()
+                weights[f.name] = [st.st_size, st.st_mtime_ns]
+    return {"files": texts, "weights": weights}
+
+
 def stage_hashes(plan: Plan) -> dict[str, str]:
-    """Each stage hashes its own inputs plus everything upstream of it."""
+    """Each stage hashes its own inputs plus everything upstream of it.
+
+    Inputs on disk (a local model folder, --data files, the eval prompts file)
+    are fingerprinted too, so editing them in place redoes the stages that read them.
+    """
+    sources = []
+    for src in plan.data.sources:
+        rec = src.model_dump()
+        if src.kind == "file":
+            rec["fingerprint"] = file_fingerprint(src.value)
+        sources.append(rec)
     regen = {
         "model": plan.model.path,
-        "sources": [s.model_dump() for s in plan.data.sources],
+        "model_files": model_fingerprint(plan.model),
+        "sources": sources,
         "max_tokens": plan.data.regen_max_tokens,
         "context": plan.data.regen_max_model_len,
     }
@@ -78,6 +183,8 @@ def stage_hashes(plan: Plan) -> dict[str, str]:
         "layout": plan.layout.model_dump(),
     }
     ev = {**train, "eval": plan.eval.model_dump()}
+    if plan.eval.prompts_file:
+        ev["eval_prompts"] = file_fingerprint(plan.eval.prompts_file)
     return {
         "regen": _digest(regen),
         "prepare": _digest(prepare),
@@ -93,7 +200,10 @@ class State:
         self.path = path
         self.data: dict = {"stages": {}}
         if path.exists():
-            self.data = json.loads(path.read_text())
+            with contextlib.suppress(ValueError, OSError):
+                loaded = json.loads(path.read_text())
+                if isinstance(loaded, dict) and isinstance(loaded.get("stages"), dict):
+                    self.data = loaded
 
     def get(self, stage: str) -> dict | None:
         return self.data["stages"].get(stage)
@@ -160,6 +270,11 @@ def count_regenerated(path: Path) -> int:
     return len(seen)
 
 
+def stages_for(plan: Plan) -> list[str]:
+    """The stages this plan runs; `hidden` only exists in offline mode."""
+    return [s for s in STAGES if s != "hidden" or plan.layout.mode == "offline"]
+
+
 class Pipeline:
     def __init__(
         self,
@@ -183,7 +298,7 @@ class Pipeline:
     # ----------------------------------------------------------------- helpers
 
     def stages(self) -> list[str]:
-        return [s for s in STAGES if s != "hidden" or self.plan.layout.mode == "offline"]
+        return stages_for(self.plan)
 
     def _exec(self, cmd: Cmd, log_name: str, grace: float | None = None) -> None:
         if self.dry_run:
@@ -230,7 +345,10 @@ class Pipeline:
     def run(self, from_stage: str | None = None, only: list[str] | None = None) -> None:
         order = self.stages()
         if from_stage and from_stage not in order:
-            raise ValueError(f"Unknown stage {from_stage!r}; stages are {order}")
+            raise ValueError(
+                f"Unknown stage {from_stage!r} for this {self.plan.layout.mode} plan; "
+                f"stages are: {', '.join(order)}"
+            )
         start = order.index(from_stage) if from_stage else 0
         dirty = False
         for i, stage in enumerate(order):
@@ -318,6 +436,8 @@ class Pipeline:
         plan, rt, p = self.plan, self.rt, self.paths
         self._claim_dir(p.checkpoints, self.hashes["train"])
         online = plan.layout.mode == "online"
+        if online and not self.dry_run:
+            self._clear_hs_stream()
         server = (
             self._server(
                 commands.extract_server(plan, rt, p.hs_stream),
@@ -329,6 +449,7 @@ class Pipeline:
         )
         log = p.logs / "train.log"
         anchors = plan.draft.max_anchors
+        retries = 0
         # Server failures propagate as they are; only the train command's own
         # failures are checked for out-of-memory and retried.
         with server:
@@ -350,18 +471,14 @@ class Pipeline:
                     can_shrink = anchors // 2 >= MIN_RETRY_ANCHORS
                     if out_of_memory and can_shrink and attempt < self.max_oom_retries:
                         anchors //= 2
+                        retries += 1
                         self.console.print(
                             f"[yellow]![/] training ran out of GPU memory; retrying with "
                             f"max_anchors={anchors}"
                         )
                         continue
                     if out_of_memory:
-                        raise StepFailed(
-                            "Training ran out of GPU memory even after shrinking max_anchors. "
-                            "Lower data.seq_len or draft.num_layers in plan.yaml.",
-                            e.log,
-                            e.tail,
-                        ) from e
+                        raise StepFailed(self._oom_message(retries, anchors), e.log, e.tail) from e
                     raise
         if self.dry_run:
             return {}
@@ -371,16 +488,65 @@ class Pipeline:
         self.console.print(f"[green]✓[/] drafter saved at {drafter}")
         return {"drafter": str(drafter), "max_anchors": anchors}
 
+    def _clear_hs_stream(self) -> None:
+        """Online hidden states are scratch data for one training run.
+
+        Files left by a crashed run may come from another target_layer_ids or
+        seq_len, so they must never be picked up; they are regenerated anyway.
+        """
+        path = self.paths.hs_stream
+        if path.exists() and any(path.iterdir()):
+            shutil.rmtree(path)
+            self.console.print(f"  cleared leftover hidden states in {path}")
+        path.mkdir(parents=True, exist_ok=True)
+
+    def _oom_message(self, retries: int, anchors: int) -> str:
+        plan = self.plan
+        if retries:
+            s = "y" if retries == 1 else "ies"
+            what = (
+                f"Training ran out of GPU memory, also after {retries} retr{s} with a smaller "
+                f"draft.max_anchors (last tried {anchors})."
+            )
+        elif self.max_oom_retries and anchors // 2 < MIN_RETRY_ANCHORS:
+            what = (
+                f"Training ran out of GPU memory with draft.max_anchors={anchors}, too small to "
+                "shrink further automatically."
+            )
+        else:
+            what = f"Training ran out of GPU memory (draft.max_anchors={anchors}, no retries)."
+        causes = [
+            "other processes using the GPU (check nvidia-smi)",
+            "DataLoader worker processes",
+            f"sequence length ({plan.data.seq_len}) or drafter size "
+            f"({plan.draft.num_layers} layers)",
+        ]
+        if plan.layout.mode == "online" and plan.layout.shared_gpu:
+            causes.insert(1, "the vLLM server sharing the GPU with training")
+        return (
+            f"{what} Likely causes: {'; '.join(causes)}. To fix: free the GPU, or in plan.yaml "
+            'set train.extra_args: ["--gradient-checkpointing", "--num-workers", "2"], or lower '
+            "data.seq_len, draft.num_layers or draft.max_anchors."
+        )
+
     def _drafter(self) -> Path | None:
+        """The trained drafter folder, if it exists on disk."""
         found = find_drafter(self.paths.checkpoints)
         if found:
             return found
         path = ((self.state.get("train") or {}).get("info") or {}).get("drafter")
-        return Path(path) if path else None
+        return Path(path) if path and (Path(path) / "config.json").exists() else None
 
     def _stage_eval(self) -> dict:
         plan, rt = self.plan, self.rt
-        drafter = self._drafter() or (self.paths.checkpoints / "checkpoint_best")
+        drafter = self._drafter()
+        if drafter is None:
+            if not self.dry_run:
+                raise StepFailed(
+                    f"No trained drafter found in {self.paths.checkpoints}. "
+                    "Run the train stage first (--from-stage train)."
+                )
+            drafter = self.paths.checkpoints / "checkpoint_best"
         prompts = bench.load_prompts(plan.eval.prompts_file, plan.eval.num_prompts)
         if not prompts:
             raise StepFailed("No usable eval prompts found.")

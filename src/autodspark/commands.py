@@ -20,15 +20,20 @@ class Cmd:
     argv: list[str]
     gpus: list[int] = field(default_factory=list)
     label: str = ""
+    # How CUDA_VISIBLE_DEVICES names a GPU index when that isn't the index itself,
+    # e.g. the GPU-... UUID the user restricted us to.
+    device_ids: dict[int, str] = field(default_factory=dict)
 
     @property
     def env(self) -> dict[str, str]:
         if not self.gpus:
             return {}
-        # nvidia-smi numbers GPUs in PCI order; make CUDA use the same order.
+        # nvidia-smi numbers GPUs in PCI order; make CUDA use the same order. Physical
+        # indices (not the user's UUIDs) because vLLM parses CUDA_VISIBLE_DEVICES as
+        # integers. The plan only holds GPUs the user allowed, so this never widens access.
         return {
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "CUDA_VISIBLE_DEVICES": ",".join(map(str, self.gpus)),
+            "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in self.gpus),
         }
 
     @property
@@ -44,11 +49,16 @@ class Cmd:
         return None
 
     def shell(self) -> str:
-        parts = [f"{k}={v}" for k, v in self.env.items()]
+        parts = [f"{k}={shlex.quote(v)}" for k, v in self.env.items()]
         if self.venv_bin:
             parts.append(f"PATH={shlex.quote(str(self.venv_bin))}:$PATH")
         cmd = shlex.join(self.argv)
         return f"{' '.join(parts)} {cmd}" if parts else cmd
+
+
+def _device_ids(plan: Plan) -> dict[int, str]:
+    """GPU index -> the user's own CUDA_VISIBLE_DEVICES name for it, where they differ."""
+    return {g.index: g.cuda_id for g in plan.hardware.gpus if g.cuda_id}
 
 
 def _trust(plan: Plan) -> list[str]:
@@ -110,12 +120,13 @@ def regen_server(plan: Plan, rt: Runtime) -> Cmd:
             plan.ports.regen,
             tp=lay.regen_tp,
             dp=lay.regen_dp,
-            mem_util=0.9,
+            mem_util=lay.regen_mem_util,
             max_model_len=plan.data.regen_max_model_len,
             extra=_trust(plan),
         ),
         gpus=lay.regen_gpus,
         label="vLLM (response regeneration)",
+        device_ids=_device_ids(plan),
     )
 
 
@@ -199,7 +210,12 @@ def extract_server(plan: Plan, rt: Runtime, hs_path: Path) -> Cmd:
     ]
     if lay.vllm_dp > 1:
         argv += ["--data-parallel-size", str(lay.vllm_dp)]
-    return Cmd(argv, gpus=lay.vllm_gpus, label="vLLM (hidden-state extraction)")
+    return Cmd(
+        argv,
+        gpus=lay.vllm_gpus,
+        label="vLLM (hidden-state extraction)",
+        device_ids=_device_ids(plan),
+    )
 
 
 def generate_offline(plan: Plan, rt: Runtime, prepared: Path, hs_out: Path) -> Cmd:
@@ -300,7 +316,10 @@ def train(
         # "warn" drops those samples at train time instead of crashing every resume.
         argv += ["--hidden-states-path", str(hs_cache), "--on-missing", "warn"]
     return Cmd(
-        argv + list(t.extra_args) + _trust(plan), gpus=lay.train_gpus, label="train DSpark drafter"
+        argv + list(t.extra_args) + _trust(plan),
+        gpus=lay.train_gpus,
+        label="train DSpark drafter",
+        device_ids=_device_ids(plan),
     )
 
 
@@ -319,12 +338,13 @@ def eval_server(plan: Plan, rt: Runtime, drafter: Path | None) -> Cmd:
             plan.model.path,
             plan.ports.eval,
             tp=tp,
-            mem_util=0.85,
+            mem_util=plan.layout.eval_mem_util,
             max_model_len=eval_max_model_len(plan),
             extra=extra,
         ),
         gpus=gpus,
         label="vLLM (eval, with DSpark)" if drafter else "vLLM (eval, baseline)",
+        device_ids=_device_ids(plan),
     )
 
 
@@ -340,16 +360,12 @@ def serve_commands(plan: Plan, drafter: Path) -> list[tuple[str, str]]:
     """User-facing commands to serve the result."""
     spec = json.dumps(speculative_config(plan, drafter))
     tp = plan.layout.regen_tp
-    tp_flag = f" --tensor-parallel-size {tp}" if tp > 1 else ""
-    cmds = [
-        (
-            "Serve your model with the drafter",
-            f"vllm serve {shlex.quote(plan.model.path)}{tp_flag} "
-            f"--speculative-config {shlex.quote(spec)}",
-        )
-    ]
+    tp_flag = ["--tensor-parallel-size", str(tp)] if tp > 1 else []
+    full = ["vllm", "serve", plan.model.path, *tp_flag, "--speculative-config", spec]
+    cmds = [("Serve your model with the drafter", shlex.join(full))]
     if not plan.model.is_local:
         # vLLM reads the target from the drafter's config, but only accepts a
         # Hub repo id there, never a local folder.
-        cmds.append(("Shorter form (target is a Hub repo id)", f"vllm serve {drafter}{tp_flag}"))
+        short = ["vllm", "serve", str(drafter), *tp_flag]
+        cmds.append(("Shorter form (target is a Hub repo id)", shlex.join(short)))
     return cmds

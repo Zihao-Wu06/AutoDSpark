@@ -152,3 +152,45 @@ def test_train_extra_args_pass_through(model_dir, rt, tmp_path):
     argv = commands.train(plan, rt, tmp_path, tmp_path).argv
     assert _after(argv, "--num-workers") == ["2"]
     assert "--gradient-checkpointing" in argv
+
+
+def test_user_gpu_uuids_become_physical_indices(model_dir, rt, tmp_path):
+    """vLLM parses CUDA_VISIBLE_DEVICES as integers, so UUIDs are mapped to PCI indices."""
+    plan = _plan(model_dir, gpus="2x80")
+    for g, u in zip(plan.hardware.gpus, ["GPU-aaaa", "GPU-bbbb"], strict=True):
+        g.cuda_id = u
+    for cmd in (
+        commands.regen_server(plan, rt),
+        commands.extract_server(plan, rt, tmp_path / "hs"),
+        commands.train(plan, rt, tmp_path, tmp_path),
+        commands.eval_server(plan, rt, None),
+    ):
+        assert cmd.env["CUDA_VISIBLE_DEVICES"] == ",".join(str(i) for i in cmd.gpus)
+        assert cmd.env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+def test_vllm_memory_follows_plan(model_dir, rt, tmp_path):
+    plan = _plan(model_dir)
+    assert _after(commands.regen_server(plan, rt).argv, "--gpu-memory-utilization") == ["0.9"]
+    assert _after(commands.eval_server(plan, rt, None).argv, "--gpu-memory-utilization") == ["0.85"]
+    plan.layout.regen_mem_util, plan.layout.eval_mem_util = 0.55, 0.5
+    assert _after(commands.regen_server(plan, rt).argv, "--gpu-memory-utilization") == ["0.55"]
+    assert _after(commands.eval_server(plan, rt, None).argv, "--gpu-memory-utilization") == ["0.5"]
+
+
+def test_serve_commands_quote_paths_with_spaces(model_dir):
+    import shlex
+
+    plan = _plan(model_dir, gpus="2x80")
+    plan.model.path = "/models/my model"
+    plan.layout.regen_tp = 2
+    drafter = Path("/work dir/checkpoint_best")
+    argv = shlex.split(commands.serve_commands(plan, drafter)[0][1])
+    assert argv[:3] == ["vllm", "serve", "/models/my model"]
+    assert _after(argv, "--tensor-parallel-size") == ["2"]
+    assert json.loads(_after(argv, "--speculative-config")[0])["model"] == str(drafter)
+    hub = plan.model_copy(deep=True)
+    hub.model.is_local = False
+    hub.model.path = "Qwen/Qwen3-0.6B"
+    short = commands.serve_commands(hub, drafter)[1][1]
+    assert shlex.split(short) == ["vllm", "serve", str(drafter), "--tensor-parallel-size", "2"]

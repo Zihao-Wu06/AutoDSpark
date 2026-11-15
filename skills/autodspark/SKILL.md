@@ -25,8 +25,9 @@ is doing in plain words, and fix problems when a stage fails.
 1. **Check the machine.**
    `autodspark doctor --model <model>`
    - No NVIDIA GPU: stop and tell the user training needs a Linux machine with NVIDIA GPUs.
-   - Environments missing: ask, then run `autodspark setup` (needs `uv` and `git`; downloads vLLM
-     and torch, several GB).
+   - Environments missing: ask, then run `autodspark setup` (needs `uv`; downloads vLLM
+     and torch, several GB, and the Speculators scripts from GitHub). Safe to re-run after a
+     network failure; existing environments are reused.
    - Work folder on a network filesystem: suggest `--workdir` on a local disk.
 
 2. **Make the plan.**
@@ -55,7 +56,8 @@ The CLI prints the failing step, the last log lines and the log path. Read the l
 | `Port 81xx is already in use` | another server running | stop it, or change `ports` in plan.yaml |
 | vLLM exits at startup, `max_model_len` / KV cache errors | not enough memory for the context | lower `data.seq_len` in plan.yaml |
 | `No such file or directory: 'ninja'`, or "FlashInfer kernels are disabled" | no precompiled FlashInfer kernels and nothing to compile them with | `<vllm env>/bin/vllm download-kernels`, or install the CUDA toolkit (nvcc) |
-| vLLM: model architecture not supported | vLLM too old for this model | `autodspark setup --vllm 'vllm>=<newer>'` |
+| vLLM: model architecture not supported | vLLM too old for this model | `autodspark setup --vllm 'vllm==<newer>'` (upgrades the existing vLLM env in place; untested, so `doctor` will warn) |
+| `doctor`: "CUDA in vLLM env" fails, torch cannot use the GPU | NVIDIA driver too old for the installed torch build | update the driver (`nvidia-smi` shows the newest CUDA it supports) |
 | 401/403 from the Hub | gated model | `huggingface-cli login` or `HF_TOKEN` |
 | regen produced 0 rows | no chat template, or prompts longer than the context | use an instruct model; raise `seq_len` |
 | `OutOfMemoryError` during train after retries | drafter too big for the GPU | lower `draft.num_layers` (min 3) or `data.seq_len` |
