@@ -1,0 +1,40 @@
+{"category": "chat", "prompt": "I'm planning a three-day trip to Kyoto in late autumn. Suggest a day-by-day itinerary that balances temples, food and walking, and explain why you ordered it that way."}
+{"category": "chat", "prompt": "My team keeps missing sprint deadlines. Give me five concrete changes to try next sprint, with how I'd know if each one worked."}
+{"category": "chat", "prompt": "Explain the difference between a Roth IRA and a traditional IRA to someone who just got their first job. Keep it practical."}
+{"category": "chat", "prompt": "Write a polite but firm email to a landlord asking them to fix a broken heater that has been reported twice already."}
+{"category": "chat", "prompt": "What are good habits for keeping houseplants alive when you travel often? Give a short checklist."}
+{"category": "chat", "prompt": "Compare electric and gas stoves for a small apartment kitchen: cost, cooking quality, safety and maintenance."}
+{"category": "code", "prompt": "Write a Python function that merges overlapping intervals in a list like [[1,3],[2,6],[8,10]]. Include type hints, a docstring and a few tests."}
+{"category": "code", "prompt": "Implement an LRU cache class in Python with get and put in O(1) time, without using functools. Explain the data structures you chose."}
+{"category": "code", "prompt": "Write a bash script that finds the ten largest files under a directory, prints their sizes in human-readable form, and handles spaces in file names."}
+{"category": "code", "prompt": "Convert this callback-style Node.js code to async/await:\n\nfs.readFile('a.txt', 'utf8', (err, a) => {\n  if (err) return cb(err);\n  fs.readFile('b.txt', 'utf8', (err, b) => {\n    if (err) return cb(err);\n    cb(null, a + b);\n  });\n});"}
+{"category": "code", "prompt": "Write a SQL query that returns, for each customer, their total spend in 2025 and their most recent order date, from tables customers(id, name) and orders(id, customer_id, amount, created_at)."}
+{"category": "code", "prompt": "Write a Go HTTP handler that accepts a JSON body {\"text\": string}, returns the word count as JSON, and rejects bodies larger than 1 MB."}
+{"category": "code", "prompt": "Explain what this Python code does and fix the bug:\n\ndef add_item(item, items=[]):\n    items.append(item)\n    return items"}
+{"category": "code", "prompt": "Write a React component in TypeScript that shows a searchable list of users fetched from /api/users, with loading and error states."}
+{"category": "math", "prompt": "A train leaves at 9:40 and travels 210 km at 84 km/h, then 90 km at 60 km/h. At what time does it arrive? Show your steps."}
+{"category": "math", "prompt": "Prove that the sum of the first n odd numbers is n squared."}
+{"category": "math", "prompt": "A bag has 5 red and 7 blue marbles. Two are drawn without replacement. What is the probability that they are different colours? Explain."}
+{"category": "math", "prompt": "Solve for x: 3^(2x) - 10 * 3^x + 9 = 0. Show the substitution you use."}
+{"category": "math", "prompt": "A shop raises a price by 20% and later cuts the new price by 20%. Is the final price higher or lower than the original, and by how much? Explain intuitively and with algebra."}
+{"category": "math", "prompt": "Find the derivative of f(x) = x^2 * ln(x) and the x where f has a minimum for x > 0."}
+{"category": "writing", "prompt": "Write a 200-word short story about a lighthouse keeper who receives a letter addressed to someone who died fifty years ago."}
+{"category": "writing", "prompt": "Rewrite this paragraph to be clearer and more concise: 'In order to be able to make sure that we are in a position to deliver the project on time, it is necessary for all of the team members to make an effort to communicate any potential issues as early as is possible.'"}
+{"category": "writing", "prompt": "Write a product description for a reusable stainless-steel water bottle aimed at hikers, under 120 words."}
+{"category": "writing", "prompt": "Draft a short speech for a colleague's retirement party. They worked in the same office for 30 years and love gardening."}
+{"category": "writing", "prompt": "Write a haiku sequence of four haiku about a city at night."}
+{"category": "zh", "prompt": "用通俗的语言解释什么是投机解码（speculative decoding），以及它为什么能加快大模型的推理速度。"}
+{"category": "zh", "prompt": "帮我写一封请假邮件给导师，说明下周三因为家里有事需要请假一天，并说明会如何补上进度。"}
+{"category": "zh", "prompt": "比较一下 Python 和 Go 在写后端服务时各自的优缺点，最后给出选型建议。"}
+{"category": "zh", "prompt": "请列出准备技术面试的一个四周计划，每周的重点和每天大概要做什么。"}
+{"category": "zh", "prompt": "写一段 Python 代码，读取一个 CSV 文件，统计每个城市的平均工资，并按平均工资从高到低输出。"}
+{"category": "zh", "prompt": "解释一下 TCP 三次握手和四次挥手的过程，以及为什么挥手需要四次。"}
+{"category": "extraction", "prompt": "Extract all dates, people and amounts from this text as JSON: 'On March 3, 2026, Alice Chen paid $1,250 to Bob Ortiz for consulting. A second payment of $800 followed on April 17.'"}
+{"category": "extraction", "prompt": "Summarize the following in three bullet points: 'The city council voted 7-2 on Tuesday to approve a new bike lane network covering 40 km of downtown streets. Construction begins in June and is expected to take 18 months. Supporters say it will cut traffic deaths; opponents worry about lost parking and disruption to local shops during construction.'"}
+{"category": "extraction", "prompt": "Classify each review as positive, negative or mixed, and give a one-line reason: 1) 'Great battery, terrible camera.' 2) 'Arrived broken and support never replied.' 3) 'Exactly what I needed, works perfectly.'"}
+{"category": "extraction", "prompt": "Turn these meeting notes into a list of action items with owners: 'Sam will update the budget sheet by Friday. We agreed Priya owns the vendor call. Nobody has taken the onboarding doc yet; Leo said he might.'"}
+{"category": "reasoning", "prompt": "Three friends split a dinner bill. Ana paid $45, Ben paid $30 and Chloe paid nothing; the bill was $75 and they want to split it evenly. Who owes whom how much?"}
+{"category": "reasoning", "prompt": "If all bloops are razzies and some razzies are lazzies, can we conclude that some bloops are lazzies? Explain why or why not."}
+{"category": "reasoning", "prompt": "A server's p50 latency is 40 ms but p99 is 2 s. List likely causes and how you would investigate each."}
+{"category": "reasoning", "prompt": "You have 8 balls, one slightly heavier, and a balance scale. What is the fewest weighings that always finds the heavy ball? Describe the procedure."}
+{"category": "reasoning", "prompt": "Should a small startup build its own authentication system or use a hosted provider? Give the trade-offs and a recommendation."}
