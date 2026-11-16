@@ -23,7 +23,7 @@
 
 ## ✨ What you get
 
-- **Faster answers.** In our Qwen3-4B test, replies came 1.5x to 2.8x faster, depending on the
+- **Faster generate.** In our Qwen3-4B test, generate came 1.5x to 2.8x faster, depending on the
   task.
 - **Same performance.** Nothing about your model changes: same weights, same answers, same quality.
 - **Made for *your* model.** Works for fine-tuned and less common models that have no ready-made
